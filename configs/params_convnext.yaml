@@ -1,0 +1,24 @@
+# configs/params_convnext.yaml
+# ConvNeXt 粗搜专用参数
+# 注意：细配仍然使用原来的 configs/params.yaml
+
+convnext_coarse:
+  model_name: "convnext_tiny"   # 或 "convnext_small"
+  img_size: 384                 # 输入 ConvNeXt 的尺寸 (H=W=384)
+  topk: 9                       # 粗搜候选数量
+  min_dist: 30                  # NMS 抑制半径 (像素，作用于 384x384 坐标系)
+  score_thresh: 0.20            # NMS 截止阈值
+  gauss_sigma_rel:              # 二维高斯先验相对标准差 [sigma_x/W, sigma_y/H]
+    - 0.12
+    - 0.20
+  priors_weight:                # 先验权重（log 空间相加）
+    sim: 1.0                    # ConvNeXt 相似度权重
+    y: 0.6                      # y 带先验权重
+    xy: 0.9                     # 二维高斯先验权重
+    skin: 0.8                   # 皮肤先验权重
+
+# 解剖区域 y 带先验 (相对高度范围)
+anatomy_band:
+  neck:  [0.10, 0.45]
+  chest: [0.30, 0.75]
+  groin: [0.50, 0.95]

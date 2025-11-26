@@ -1,0 +1,105 @@
+template:
+  synth:
+    tilt: [1.0, 1.2, 1.6, 2.0, 2.4, 2.8, 3.0]
+    rot_deg_step: 30
+    scale: [0.7, 0.85, 1.0, 1.25, 1.5, 1.7]
+    gamma: [0.8, 1.0, 1.2]
+    contrast: [0.9, 1.0, 1.1]
+    blur_sigma: [0.0, 0.8]
+    noise_sigma: [0, 5]
+
+  features:
+    algo: SIFT
+    sift:
+      nfeatures: 4000
+      contrastThreshold: 0.01
+      edgeThreshold: 8
+    orb:
+      nfeatures: 3000
+      scaleFactor: 1.2
+      nlevels: 8
+
+  rings:
+    radii_scale: [1.05, 1.35, 1.70, 2.10]
+    thickness_px: 8
+
+  coarse:
+    edge_low: 35
+    edge_high: 110
+    rot_deg_step: 20
+    scales: [0.55, 0.70, 0.85, 1.00, 1.20, 1.40, 1.60, 1.85, 2.10]
+    max_templates: 120
+    mask_inner_ratio: 0.92
+    ring_keep_scale: [1.15, 2.10]
+
+relocalize:
+  coarse:
+    pyramid_scales:  [0.5, 0.7, 1.0]
+    template_scales: [0.45, 0.6, 0.8, 1.0, 1.2, 1.5, 1.8, 2.2]
+    pre_topk: 900
+    ring_weight: 0.35        # 已经降低
+    ring_mode: grad
+    nms_min_dist: 42
+    topk: 9
+    edge_low: 45
+    edge_high: 135
+    y_prior:
+      enable: true
+      band: [0.30, 0.75]
+      sigma: 0.10
+    skin_prior_weight: 0.70
+    border_margin_px: 28
+    xy_prior_sigma_x: 0.10   # 已经加过，用来生成 prior_xy_heat
+    xy_prior_sigma_y: 0.08
+
+  match:
+    matcher: FLANN
+    lowe_ratio: 0.80
+    ransac:
+      method: USAC_MAGSAC
+      thresh_px: 4.0
+    center:
+      enable: true
+      max_shift_r: 1.0     # 细配中心最多允许偏离 coarse 1 个贴片半径
+      alpha: 0.35          # 最终中心 = (1-alpha)*coarse + alpha*refined
+
+    score_weights:
+      inlier: 1.1
+      rmse: -0.15
+      center: -0.60          # 强惩罚“离 coarse 太远”的结果
+      coarse: 0.40           # 粗配得分权重更高
+      chamfer: -0.10
+      fft: 0.00
+      dark: -0.30
+
+  accept:
+    min_inlier_ratio: 0.40
+    max_rmse_px: 3.5
+    min_ncc: 0.58
+
+  refine_ncc:
+    window_px: 8
+
+presets:
+  neck:
+    relocalize.coarse.y_prior.band: [0.10, 0.45]
+    relocalize.coarse.y_prior.sigma: 0.10
+    relocalize.coarse.ring_weight: 0.70
+  chest:
+    relocalize.coarse.y_prior.band: [0.30, 0.75]
+    relocalize.coarse.y_prior.sigma: 0.10
+    relocalize.coarse.ring_weight: 0.65
+  groin:
+    relocalize.coarse.y_prior.band: [0.45, 0.88]
+    relocalize.coarse.y_prior.sigma: 0.12
+    relocalize.coarse.ring_weight: 0.55
+  fast_debug:
+    template.synth.tilt: [1.0, 2.0]
+    template.synth.rot_deg_step: 60
+    template.synth.scale: [0.9, 1.0, 1.3]
+    template.coarse.rot_deg_step: 30
+    template.coarse.scales: [0.7, 1.0, 1.4]
+    template.coarse.max_templates: 48
+    relocalize.coarse.pre_topk: 200
+    relocalize.coarse.template_scales: [0.8, 1.0, 1.2]
+    relocalize.coarse.topk: 5
