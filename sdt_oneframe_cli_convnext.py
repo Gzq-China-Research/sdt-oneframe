@@ -1,32 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sdt_oneframe_cli_convnext.py
-- 术前单张 + 术中单张 + ConvNeXt 粗搜 + 细配 (fine_match_convnext)
-- 完全不修改旧机器视觉粗搜代码，只是新增一条 pipeline
-
-用法示例:
-python sdt_oneframe_cli_convnext.py \
-  --preop data/raw/Color_3.bmp \
-  --intra data/raw/Color_4.bmp \
-  --anatomy chest \
-  --patch_diam_mm 10.0 \
-  --patch_height_mm 0.39 \
-  --mask_inner_ratio 0.92 \
-  --params configs/params_convnext.yaml \
-  --outdir results_chest_convnext \
-  --debug_dir results_chest_convnext/debug
+sdt_oneframe_cli_convnext.py (v3.1 - Fix for Context-Aware Pipeline)
+- 适配新的 build_convnext_template.py (移除 img_size, 新增 context_size)
+- 适配新的 coarse_search_convnext.py
 """
 
 import argparse
 import subprocess
 from pathlib import Path
-
+import sys
 
 def run(cmd_list):
     print(">>>", " ".join(cmd_list))
     subprocess.check_call(cmd_list)
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -68,18 +55,18 @@ def main():
         "--patch_height_mm",
         type=float,
         default=0.39,
-        help="圆形贴片高度 (mm)，目前只记录，不直接参与 ConvNeXt 计算",
+        help="圆形贴片高度 (mm)",
     )
     ap.add_argument(
         "--mask_inner_ratio",
         type=float,
         default=0.9,
-        help="贴片内部遮挡的半径比例（用于旧模板生成）",
+        help="贴片内部遮挡的半径比例",
     )
     ap.add_argument(
         "--debug_dir",
         default=None,
-        help="调试输出目录 (含 coarse/fine 可视化)",
+        help="调试输出目录",
     )
     args = ap.parse_args()
 
@@ -95,8 +82,9 @@ def main():
         Path(args.debug_dir).mkdir(parents=True, exist_ok=True)
 
     # 1) 旧 build_from_one：检测贴片 + 生成经典模板/meta.json
+    # 注意：这里依然使用 Python 解释器调用，确保环境一致
     cmd1 = [
-        "python",
+        sys.executable,
         "build_from_one.py",
         "--preop",
         preop,
@@ -111,16 +99,17 @@ def main():
         "--anatomy",
         anatomy,
         "--params",
-        "configs/params.yaml",  # 注意: 这里用你旧的 params.yaml
+        "configs/params.yaml",  # 基础模板参数
     ]
     if args.debug_dir:
         cmd1 += ["--debug_dir", str(Path(args.debug_dir) / "preop")]
     run(cmd1)
 
     # 2) 新 build_convnext_template：基于术前 + meta.json 生成 ConvNeXt 模板
+    # 修改点：移除 --img_size，改为 --context_size 192
     conv_meta_path = templates_dir / "meta_convnext.json"
     cmd2 = [
-        "python",
+        sys.executable,
         "build_convnext_template.py",
         "--preop",
         preop,
@@ -130,15 +119,15 @@ def main():
         str(conv_meta_path),
         "--model_name",
         "convnext_tiny",
-        "--img_size",
-        "384",
+        "--context_size",  # <--- NEW: 强制大感受野
+        "192",             # 像素，建议 192 或 224
     ]
     run(cmd2)
 
     # 3) 新 coarse_search_convnext：术中 ConvNeXt 粗搜 -> candidates_convnext.json
     cand_path = templates_dir / "candidates_convnext.json"
     cmd3 = [
-        "python",
+        sys.executable,
         "coarse_search_convnext.py",
         "--intra",
         intra,
@@ -157,11 +146,11 @@ def main():
         cmd3 += ["--debug_dir", str(Path(args.debug_dir) / "coarse_convnext")]
     run(cmd3)
 
-    # 4) 新 fine_match_convnext：吃 ConvNeXt 生成的候选，做细配/或回退到 coarse 最佳
+    # 4) 新 fine_match_convnext：吃 ConvNeXt 生成的候选，做细配
     relocalize_json = outdir / "relocalize_convnext.json"
     vis_png = outdir / "vis_relocalize_convnext.png"
     cmd4 = [
-        "python",
+        sys.executable,
         "fine_match_convnext.py",
         "--intra",
         intra,
@@ -176,7 +165,7 @@ def main():
         "--anatomy",
         anatomy,
         "--params",
-        "configs/params.yaml",  # 细配仍用旧 params.yaml
+        "configs/params.yaml",  # 细配参数
     ]
     if args.debug_dir:
         cmd4 += ["--debug_dir", str(Path(args.debug_dir) / "fine_convnext")]
