@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-coarse_search_convnext.py (v4 - Prior Guided & Patch Based)
-- 逻辑变更：先验筛选 -> 局部Patch裁剪 -> 批量特征比对 -> 重排序
-- 解决全图特征图分辨率低、特征坍塌、背景误判的问题
+coarse_search_convnext.py
+- 创新点实现：测试时数据增强 (Test-Time Augmentation, TTA)
+- 结合多源先验 (Anatomy + Skin) 进行候选点采样
+- 对每个候选 Patch 进行旋转/亮度微扰，取平均相似度以抑制噪声
 """
 
 import os
@@ -32,29 +33,59 @@ def load_yaml(p, default_={}):
 
 
 def get_skin_mask(bgr):
-    """更严格的皮肤检测 (针对体模/人体)"""
+    """
+    更严格的皮肤检测
+    """
     ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
     # 严格阈值，过滤黄色地面和背景
-    # Cr: 140-173 (偏红分量), Cb: 100-127 (偏蓝分量控制)
+    # Cr: 140-180 (偏红), Cb: 100-135 (偏蓝限制)
     lower = np.array([0, 140, 100])
     upper = np.array([255, 180, 135])
     mask = cv2.inRange(ycrcb, lower, upper)
 
-    # 形态学操作：闭运算填孔，开运算去噪
+    # 形态学操作
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     return mask
 
 
+def augment_patch(patch):
+    """
+    TTA 生成器：生成 5 个版本的 Patch
+    1. 原图
+    2. 旋转 +5度
+    3. 旋转 -5度
+    4. 亮度 +10%
+    5. 亮度 -10%
+    """
+    h, w = patch.shape[:2]
+    center = (w // 2, h // 2)
+    aug_list = [patch]  # 原图
+
+    # 旋转增强
+    for ang in [5, -5]:
+        M = cv2.getRotationMatrix2D(center, ang, 1.0)
+        rot = cv2.warpAffine(patch, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
+        aug_list.append(rot)
+
+    # 亮度增强
+    patch_f = patch.astype(np.float32)
+    for gain in [1.1, 0.9]:
+        bright = np.clip(patch_f * gain, 0, 255).astype(np.uint8)
+        aug_list.append(bright)
+
+    return aug_list
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--intra", required=True)
-    ap.add_argument("--templates", required=True)
-    ap.add_argument("--conv_meta", required=True)
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--params", default=None)
-    ap.add_argument("--anatomy", default="auto")
+    ap.add_argument("--intra", required=True, help="术中无贴片图像")
+    ap.add_argument("--templates", required=True, help="模板目录")
+    ap.add_argument("--conv_meta", required=True, help="ConvNeXt 模板 Meta")
+    ap.add_argument("--out", required=True, help="输出 candidates.json")
+    ap.add_argument("--params", default=None, help="参数文件")
+    ap.add_argument("--anatomy", default="auto", help="解剖部位")
     ap.add_argument("--debug_dir", default=None)
     ap.add_argument("--device", default=None)
     args = ap.parse_args()
@@ -64,8 +95,7 @@ def main():
     conv_cfg = params.get("convnext_coarse", {})
 
     # 读取 Meta
-    conv_meta = json.load(open(args.conv_meta, "r"))
-    # 获取模板制作时的 patch 大小，如果没存则默认 192
+    conv_meta = json.load(open(args.conv_meta, "r", encoding="utf-8"))
     L_pixel = conv_meta.get("patch_context_size", 192)
     tpl_vec = np.array(conv_meta["template_feature"], dtype=np.float32)
 
@@ -77,43 +107,32 @@ def main():
     if args.debug_dir: ensure_dir(Path(args.debug_dir))
 
     # 2. 构建先验概率图 (Prior Map)
-    # 2.1 肤色先验 (强约束)
+    # 2.1 肤色先验
     skin_mask = get_skin_mask(intra_bgr)
     skin_float = skin_mask.astype(np.float32) / 255.0
 
-    # 2.2 解剖位置 Y 轴先验
-    # 读取 anatomy 设置
-    meta_old = json.load(open(Path(args.templates) / "meta.json"))
+    # 2.2 解剖 Y 轴先验
+    meta_old = json.load(open(Path(args.templates) / "meta.json", "r", encoding="utf-8"))
     anatomy = args.anatomy if args.anatomy != "auto" else meta_old.get("anatomy", "chest")
 
-    # 默认 Chest: 0.3-0.75
     bands = params.get("anatomy_band", {"neck": [0.1, 0.45], "chest": [0.3, 0.75], "groin": [0.5, 0.95]})
     y_band = bands.get(anatomy, [0.3, 0.75])
 
     y_indices = np.arange(H)
     y_center = (y_band[0] + y_band[1]) / 2.0 * H
     y_width = (y_band[1] - y_band[0]) * H
-    # 高斯分布模拟
     sigma = y_width * 0.6
     y_prior_vec = np.exp(-0.5 * ((y_indices - y_center) / sigma) ** 2)
     y_prior_map = np.tile(y_prior_vec[:, None], (1, W))
 
-    # 2.3 综合先验图
-    # 逻辑：必须是皮肤 (skin>0)，且在解剖带附近分数更高
-    # 加上一个底数 0.01 防止完全为 0 (虽然为了效率我们会过滤掉低的)
+    # 2.3 综合先验
     combined_prior = y_prior_map * (skin_float + 0.05)
-    combined_prior = cv2.GaussianBlur(combined_prior, (31, 31), 0)  # 平滑一下
+    combined_prior = cv2.GaussianBlur(combined_prior, (31, 31), 0)  # 平滑
     combined_prior /= (combined_prior.max() + 1e-6)
 
-    if args.debug_dir:
-        cv2.imwrite(str(Path(args.debug_dir) / "debug_skin.png"), skin_mask)
-        cv2.imwrite(str(Path(args.debug_dir) / "debug_prior.png"), (combined_prior * 255).astype(np.uint8))
-
-    # 3. 基于先验采样候选点 (Grid Sampling)
-    # 策略：在 Prior > Threshold 的区域，每隔 Step 采一个点
-    prior_thresh = 0.15  # 忽略低概率区域 (如地面)
-    step = 16  # 采样步长 (像素)
-
+    # 3. 采样候选点 (Grid Sampling)
+    prior_thresh = 0.15
+    step = 16
     candidates_xy = []
 
     # Pad 原图以便在边缘裁切 Patch
@@ -125,80 +144,82 @@ def main():
             if combined_prior[y, x] > prior_thresh:
                 candidates_xy.append((x, y))
 
-    print(f"[Coarse] Sampling: {len(candidates_xy)} points from prior map (step={step}).")
+    print(f"[Coarse TTA] Sampling: {len(candidates_xy)} points based on prior.")
 
     if len(candidates_xy) == 0:
-        print("[Coarse] WARN: No candidates passed prior check! Fallback to center grid.")
-        # 兜底：在图像中心区域强行采一些点
+        print("[Coarse TTA] WARN: No candidates! Fallback to center.")
         cx, cy = W // 2, H // 2
-        for y in range(cy - 100, cy + 100, 40):
-            for x in range(cx - 100, cx + 100, 40):
-                candidates_xy.append((x, y))
+        candidates_xy.append((cx, cy))
 
-    # 4. 批量提取特征 & 计算相似度
-    # 准备 Patch Batch
-    patch_list = []
-    batch_size = 64
+    # 4. 批量 TTA 特征提取
     extractor = ConvNeXtFeatureExtractor(model_name=conv_cfg.get("model_name", "convnext_tiny"), device=args.device)
 
     sim_scores = []
+    batch_size_points = 8  # 每次处理8个点 -> 8 * 5 = 40 张图
 
-    # 分批处理
-    for i in tqdm(range(0, len(candidates_xy), batch_size), desc="ConvNeXt Scanning"):
-        batch_coords = candidates_xy[i: i + batch_size]
-        batch_imgs = []
+    for i in tqdm(range(0, len(candidates_xy), batch_size_points), desc="ConvNeXt TTA"):
+        batch_coords = candidates_xy[i: i + batch_size_points]
+
+        all_aug_imgs = []
+        counts = []
 
         for (cx, cy) in batch_coords:
             # 坐标变换到 Padded 图
             x0 = cx
             y0 = cy
-            # 裁切 L_pixel x L_pixel
-            p = img_padded[y0: y0 + L_pixel, x0: x0 + L_pixel]
-            batch_imgs.append(p)
+            patch = img_padded[y0: y0 + L_pixel, x0: x0 + L_pixel]
 
-        # 提特征 [B, C]
-        feats = extractor.extract_batch_features(batch_imgs)
-        # 算相似度 (Dot product, 因为已 L2 norm)
-        sims = np.dot(feats, tpl_vec)
-        sim_scores.extend(sims.tolist())
+            # TTA: 生成 5 个变体
+            augs = augment_patch(patch)
+            all_aug_imgs.extend(augs)
+            counts.append(len(augs))
 
-    # 5. 融合分数 & 生成 Heatmap 可视化
-    # 为了生成 sim_up.png，我们把离散点填回去
-    sparse_sim_map = np.zeros((H, W), dtype=np.float32)
+        # 批量提特征
+        feats = extractor.extract_batch_features(all_aug_imgs)  # [N_total, C]
+
+        # 计算与模板的相似度
+        sims = np.dot(feats, tpl_vec)  # [N_total]
+
+        cursor = 0
+        for cnt in counts:
+            # 取平均值作为最终得分 (Mean Aggregation)
+            point_sims = sims[cursor: cursor + cnt]
+            avg_sim = np.mean(point_sims)
+            sim_scores.append(avg_sim)
+            cursor += cnt
+
+    # 5. 融合分数与 NMS
     final_candidates = []
-
-    # 权重配置
     w_sim = 0.7
     w_prior = 0.3
+
+    sparse_sim_map = np.zeros((H, W), dtype=np.float32)
 
     for idx, (cx, cy) in enumerate(candidates_xy):
         s_sim = sim_scores[idx]
         s_prior = combined_prior[cy, cx]
 
-        # 融合分数
-        # 注意：ConvNeXt 相似度可能在 [-1, 1]，通常在 [0.3, 0.9] 之间
-        # 将其归一化到 [0, 1] 区间便于融合 (假设 min sim ~ 0.2)
+        # 相似度截断归一化
         s_sim_norm = max(0, s_sim)
-
         score = w_sim * s_sim_norm + w_prior * s_prior
 
-        sparse_sim_map[cy, cx] = s_sim_norm  # 仅用于绘图
+        sparse_sim_map[cy, cx] = s_sim_norm
 
         final_candidates.append({
             "u": float(cx),
             "v": float(cy),
             "score": float(score),
             "raw_sim": float(s_sim),
-            "source": "convnext_grid"
+            "source": "convnext_tta"
         })
 
-    # 6. NMS (Non-Maximum Suppression)
+    # 排序
     final_candidates.sort(key=lambda x: x["score"], reverse=True)
 
+    # NMS
     kept = []
     min_dist = 40  # 像素
     for c in final_candidates:
-        # 简单空间抑制
         is_far = True
         for k in kept:
             dist = np.hypot(c["u"] - k["u"], c["v"] - k["v"])
@@ -210,35 +231,29 @@ def main():
             if len(kept) >= conv_cfg.get("topk", 9):
                 break
 
-    # 7. 输出结果
+    # 6. 保存输出
     ensure_dir(Path(args.out).parent)
     with open(args.out, "w", encoding="utf-8") as f:
-        json.dump(kept, f, indent=2)
+        json.dump(kept, f, indent=2, ensure_ascii=False)
 
     print(f"[Coarse] Saved {len(kept)} candidates to {args.out}")
-    if len(kept) > 0:
-        print(
-            f"  Top-1 Score: {kept[0]['score']:.4f} (Sim: {kept[0].get('raw_sim', 0):.4f}) at ({kept[0]['u']:.1f}, {kept[0]['v']:.1f})")
 
-    # 8. 调试可视化
+    # 7. 调试可视化
     if args.debug_dir:
         # 插值生成平滑 heatmap
         sim_vis = cv2.GaussianBlur(sparse_sim_map, (31, 31), 10)
         sim_vis = sim_vis / (sim_vis.max() + 1e-9) * 255
         sim_vis = cv2.applyColorMap(sim_vis.astype(np.uint8), cv2.COLORMAP_JET)
 
-        # 叠加原图
         overlay = cv2.addWeighted(intra_bgr, 0.6, sim_vis, 0.4, 0)
 
-        # 画 Top-K
         for i, c in enumerate(kept):
-            uv = (int(c['u']), int(c['v']))
-            cv2.drawMarker(overlay, uv, (0, 255, 0), cv2.MARKER_CROSS, 20, 2)
-            cv2.putText(overlay, f"{i + 1}", (uv[0] + 10, uv[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(overlay, f"{i + 1}", (int(c['u']), int(c['v'])),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
         cv2.imwrite(str(Path(args.debug_dir) / "sim_up.png"), sim_vis)
         cv2.imwrite(str(Path(args.debug_dir) / "overlay_score_peaks.png"), overlay)
-        cv2.imwrite(str(Path(args.debug_dir) / "candidates_on_intra.png"), overlay)  # 复用一张
+        cv2.imwrite(str(Path(args.debug_dir) / "candidates_on_intra.png"), overlay)
 
 
 if __name__ == "__main__":
